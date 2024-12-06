@@ -50,7 +50,12 @@ async fn main() -> Result<()> {
                 while let Some(msg) = rx.recv().await {
                     match msg {
                         SignalingMessage::RequestPeerList => {
-                            // Send request to server
+                            let write = write.clone();
+                            let msg = Message::Text("get_peers".to_string());
+                            let mut guard = write.lock().await;
+                            if let Err(e) = guard.send(msg).await {
+                                eprintln!("Failed to request peer list: {}", e);
+                            }
                         }
                         SignalingMessage::InitiateCall { peer_id, room_id } => {
                             let write = write.clone();
@@ -107,7 +112,9 @@ async fn setup_signaling(
                 if let Ok(signal_msg) = serde_json::from_str::<SignalingMessage>(text) {
                     match signal_msg {
                         SignalingMessage::PeerList { peers } => {
-                            tx.send(SignalingMessage::PeerList { peers })?;
+                            if let Some(app) = ui::Application::get_instance() {
+                                app.update_peer_list(peers);
+                            }
                         },
                         SignalingMessage::Offer { sdp, .. } => {
                             let desc = webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(sdp)?;
@@ -174,6 +181,7 @@ async fn handle_call_initiation(
         to_peer: peer_id,
     };
     
-    write.lock().await.send(Message::Text(serde_json::to_string(&offer_msg)?)).await?;
+    let mut guard = write.lock().await;
+    guard.send(Message::Text(serde_json::to_string(&offer_msg)?)).await?;
     Ok(())
 }
