@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 use futures_util::stream::SplitSink;
 use tokio_tungstenite::tungstenite::Message;
-use parking_lot::Mutex;
+use tokio::sync::Mutex as TokioMutex;
 
 mod signaling;
 mod ui;
@@ -42,23 +42,33 @@ async fn main() -> Result<()> {
     
     // Handle incoming messages from the UI
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            // Handle UI messages
-            match msg {
-                SignalingMessage::RequestPeerList => {
-                    // Send request to server
-                }
-                SignalingMessage::InitiateCall { peer_id, room_id } => {
-                    if let Err(e) = handle_call_initiation(
-                        peer_connection.clone(),
-                        peer_id,
-                        room_id,
-                        &mut write
-                    ).await {
-                        eprintln!("Error initiating call: {}", e);
+        match connect_to_signaling_server("ws://127.0.0.1:8080").await {
+            Ok(ws_stream) => {
+                let (write, _read) = ws_stream.split();
+                let write = Arc::new(TokioMutex::new(write));
+
+                while let Some(msg) = rx.recv().await {
+                    match msg {
+                        SignalingMessage::RequestPeerList => {
+                            // Send request to server
+                        }
+                        SignalingMessage::InitiateCall { peer_id, room_id } => {
+                            let write = write.clone();
+                            if let Err(e) = handle_call_initiation(
+                                peer_connection.clone(),
+                                peer_id,
+                                room_id,
+                                write,
+                            ).await {
+                                eprintln!("Error initiating call: {}", e);
+                            }
+                        },
+                        _ => {}
                     }
-                },
-                _ => {}
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to connect to signaling server: {}", e);
             }
         }
     });
@@ -75,17 +85,21 @@ async fn setup_signaling(
 ) -> Result<()> {
     let ws_stream = connect_to_signaling_server("ws://127.0.0.1:8080").await?;
     let (write, mut read) = ws_stream.split();
-    let write = Arc::new(Mutex::new(write));
-    let write_clone = write.clone();
+    let write = Arc::new(TokioMutex::new(write));
 
     // Join a room
     let join_msg = SignalingMessage::Join {
         room_id: "test-room".to_string(),
         peer_id: peer_id.clone(),
     };
-    write.lock().await.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&join_msg)?,
-    )).await?;
+    
+    // Create a temporary scope for the lock
+    {
+        let msg = tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&join_msg)?
+        );
+        write.lock().await.send(msg).await?;
+    }
 
     while let Some(msg) = read.next().await {
         if let Ok(msg) = msg {
@@ -93,7 +107,6 @@ async fn setup_signaling(
                 if let Ok(signal_msg) = serde_json::from_str::<SignalingMessage>(text) {
                     match signal_msg {
                         SignalingMessage::PeerList { peers } => {
-                            // Forward peer list to UI
                             tx.send(SignalingMessage::PeerList { peers })?;
                         },
                         SignalingMessage::Offer { sdp, .. } => {
@@ -109,9 +122,14 @@ async fn setup_signaling(
                                 from_peer: peer_id.clone(),
                                 to_peer: "".to_string(),
                             };
-                            write.lock().await.send(tokio_tungstenite::tungstenite::Message::Text(
-                                serde_json::to_string(&answer_msg)?,
-                            )).await?;
+                            
+                            // Create a temporary scope for the lock
+                            {
+                                let msg = tokio_tungstenite::tungstenite::Message::Text(
+                                    serde_json::to_string(&answer_msg)?
+                                );
+                                write.lock().await.send(msg).await?;
+                            }
                         },
                         SignalingMessage::Answer { sdp, .. } => {
                             let desc = webrtc::peer_connection::sdp::session_description::RTCSessionDescription::answer(sdp)?;
@@ -142,7 +160,7 @@ async fn handle_call_initiation(
     peer_connection: Arc<RTCPeerConnection>,
     peer_id: String,
     room_id: String,
-    write: &mut SplitSink<WebSocketStream<TcpStream>, Message>
+    write: Arc<TokioMutex<SplitSink<WebSocketStream<TcpStream>, Message>>>
 ) -> Result<()> {
     // Create offer
     let offer = peer_connection.create_offer(None).await?;
@@ -152,10 +170,10 @@ async fn handle_call_initiation(
     let offer_msg = SignalingMessage::Offer {
         room_id,
         sdp: offer.sdp,
-        from_peer: peer_id,
+        from_peer: peer_id.clone(),
         to_peer: peer_id,
     };
     
-    write.send(Message::Text(serde_json::to_string(&offer_msg)?)).await?;
+    write.lock().await.send(Message::Text(serde_json::to_string(&offer_msg)?)).await?;
     Ok(())
 }

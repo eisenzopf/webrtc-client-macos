@@ -1,41 +1,51 @@
 use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::{NSRect, NSPoint, NSSize, NSString};
 use objc::{class, msg_send, sel, sel_impl};
-use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use crate::signaling::SignalingMessage;
 use objc::runtime::{Object, Sel};
-use objc::declare::ClassDecl;
 use parking_lot::Mutex;
+use parking_lot::Mutex as OnceMutex;
+use std::sync::Once;
+use once_cell::sync::Lazy;
 
 pub struct Application {
     window: id,
     peer_list: id,
     tx: mpsc::UnboundedSender<SignalingMessage>,
     peers: Arc<Mutex<Vec<String>>>,
-    _not_send: PhantomData<*const ()>,
 }
 
+unsafe impl Send for Application {}
+unsafe impl Sync for Application {}
+
+static INSTANCE: Lazy<Mutex<Option<Arc<Application>>>> = Lazy::new(|| Mutex::new(None));
+static INIT: Once = Once::new();
+
 impl Application {
-    pub fn new(tx: mpsc::UnboundedSender<SignalingMessage>) -> Self {
+    pub fn new(tx: mpsc::UnboundedSender<SignalingMessage>) -> Arc<Self> {
+        let instance = Arc::new(Self {
+            window: nil,
+            peer_list: nil,
+            tx,
+            peers: Arc::new(Mutex::new(Vec::new())),
+        });
+        
+        *INSTANCE.lock() = Some(instance.clone());
+        
+        instance
+    }
+    
+    pub fn get_instance() -> Option<Arc<Self>> {
+        INSTANCE.lock().clone()
+    }
+    
+    pub fn run(self: &Arc<Self>) {
         unsafe {
             let app: id = msg_send![class!(NSApplication), sharedApplication];
-            let window = Self::create_window();
-            let peer_list = Self::create_peer_list(window);
-            
-            let instance = Self { 
-                window,
-                peer_list,
-                tx: tx.clone(),
-                peers: Arc::new(Mutex::new(Vec::new())),
-                _not_send: PhantomData 
-            };
-            
-            // Request initial peer list
-            let _ = tx.send(SignalingMessage::RequestPeerList);
-            
-            instance
+            let _: () = msg_send![self.window, makeKeyAndOrderFront: nil];
+            let _: () = msg_send![app, run];
         }
     }
 
@@ -88,8 +98,9 @@ impl Application {
                 unsafe {
                     let selected_row: i64 = msg_send![this, selectedRow];
                     if selected_row >= 0 {
-                        let app = Application::get_instance();
-                        app.handle_peer_selected(selected_row as usize);
+                        if let Some(app) = Application::get_instance() {
+                            app.handle_peer_selected(selected_row as usize);
+                        }
                     }
                 }
             }
@@ -106,14 +117,6 @@ impl Application {
         }
     }
 
-    pub fn run(&self) {
-        unsafe {
-            let app: id = msg_send![class!(NSApplication), sharedApplication];
-            let _: () = msg_send![self.window, makeKeyAndOrderFront: nil];
-            let _: () = msg_send![app, run];
-        }
-    }
-
     fn handle_peer_selected(&self, index: usize) {
         if let Some(peer_id) = self.get_peer_at_index(index) {
             // Send message to initiate call
@@ -125,7 +128,6 @@ impl Application {
     }
 
     fn get_peer_at_index(&self, index: usize) -> Option<String> {
-        let peers = self.peers.lock();
-        peers.get(index).cloned()
+        self.peers.lock().get(index).cloned()
     }
 }
